@@ -3,99 +3,93 @@ import os
 import time
 from datetime import datetime
 import threading
+from db import get_db_conn, db_lock
 
-STATS_FILE = "data/stats.json"
 
 class StatsManager:
-    def __init__(self, stats_file=STATS_FILE):
-        self.stats_file = stats_file
-        self.lock = threading.Lock()
-        self.stats = self._load_stats()
+    def __init__(self):
+        pass
 
-    def _load_stats(self):
-        if os.path.exists(self.stats_file):
-            try:
-                with open(self.stats_file, "r") as f:
-                    stats = json.load(f)
-                    # Check for day/month reset
-                    now = datetime.now()
-                    current_day = now.strftime("%Y-%m-%d")
-                    current_month = now.strftime("%Y-%m")
-
-                    if stats.get("day") != current_day:
-                        stats["day"] = current_day
-                        stats["daily_api_calls"] = 0
-                        stats["daily_now_requests"] = 0
-
-                    if stats.get("month") != current_month:
-                        stats["month"] = current_month
-                        stats["monthly_api_calls"] = 0
-
-                    return stats
-            except (json.JSONDecodeError, FileNotFoundError):
-                pass
-
-        now = datetime.now()
-        return {
-            "day": now.strftime("%Y-%m-%d"),
-            "month": now.strftime("%Y-%m"),
-            "daily_api_calls": 0,
-            "monthly_api_calls": 0,
-            "daily_now_requests": 0
-        }
-
-    def _save_stats(self):
-        with open(self.stats_file, "w") as f:
-            json.dump(self.stats, f, indent=4)
-
-    def increment_api_call(self):
-        with self.lock:
-            self._check_reset()
-            self.stats["daily_api_calls"] += 1
-            self.stats["monthly_api_calls"] += 1
-            self._save_stats()
-
-    def increment_now_request(self):
-        with self.lock:
-            self._check_reset()
-            self.stats["daily_now_requests"] += 1
-            self._save_stats()
-
-    def _check_reset(self):
+    def _ensure_daily_reset(self, cursor):
+        """Ensures stats are reset for the current day/month within a transaction"""
         now = datetime.now()
         current_day = now.strftime("%Y-%m-%d")
         current_month = now.strftime("%Y-%m")
 
-        changed = False
-        if self.stats.get("day") != current_day:
-            self.stats["day"] = current_day
-            self.stats["daily_api_calls"] = 0
-            self.stats["daily_now_requests"] = 0
-            changed = True
+        cursor.execute("SELECT day, month FROM stats WHERE id = 1")
+        row = cursor.fetchone()
+        if not row:
+            return
 
-        if self.stats.get("month") != current_month:
-            self.stats["month"] = current_month
-            self.stats["monthly_api_calls"] = 0
-            changed = True
+        updates = []
+        params = []
 
-        if changed:
-            self._save_stats()
+        if row["day"] != current_day:
+            updates.append("day = ?, daily_api_calls = 0, daily_now_requests = 0")
+            params.append(current_day)
+
+        if row["month"] != current_month:
+            updates.append("month = ?, monthly_api_calls = 0")
+            params.append(current_month)
+
+        if updates:
+            cursor.execute(
+                f"UPDATE stats SET {', '.join(updates)} WHERE id = 1", params
+            )
+
+    def increment_api_call(self):
+        with db_lock:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                self._ensure_daily_reset(cursor)
+                cursor.execute("""
+                    UPDATE stats SET
+                        daily_api_calls = daily_api_calls + 1,
+                        monthly_api_calls = monthly_api_calls + 1
+                    WHERE id = 1
+                """)
+                conn.commit()
+
+    def increment_now_request(self):
+        with db_lock:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                self._ensure_daily_reset(cursor)
+                cursor.execute("""
+                    UPDATE stats SET
+                        daily_now_requests = daily_now_requests + 1
+                    WHERE id = 1
+                """)
+                conn.commit()
 
     def can_make_api_call(self):
-        with self.lock:
-            self._check_reset()
-            return (self.stats["daily_api_calls"] < 1000 and
-                    self.stats["monthly_api_calls"] < 31000)
+        with db_lock:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                self._ensure_daily_reset(cursor)
+                cursor.execute(
+                    "SELECT daily_api_calls, monthly_api_calls FROM stats WHERE id = 1"
+                )
+                stats = cursor.fetchone()
+                return (
+                    stats["daily_api_calls"] < 1000
+                    and stats["monthly_api_calls"] < 31000
+                )
 
     def can_make_now_request(self, active_subscribers_count):
-        with self.lock:
-            self._check_reset()
-            max_now = max(0, 1000 - active_subscribers_count)
-            return self.stats["daily_now_requests"] < max_now
+        with db_lock:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                self._ensure_daily_reset(cursor)
+                cursor.execute("SELECT daily_now_requests FROM stats WHERE id = 1")
+                stats = cursor.fetchone()
+                max_now = max(0, 1000 - active_subscribers_count)
+                return stats["daily_now_requests"] < max_now
+
 
 class WeatherCache:
     def __init__(self):
-        self.cache = {} # {city_name: {type: {data, expires}}}
+        self.cache = {}  # {city_name: {type: {data, expires}}}
         self.lock = threading.Lock()
 
     def get(self, city_name, weather_type):
@@ -112,5 +106,5 @@ class WeatherCache:
                 self.cache[city_name] = {}
             self.cache[city_name][weather_type] = {
                 "data": data,
-                "expires": time.time() + duration_seconds
+                "expires": time.time() + duration_seconds,
             }

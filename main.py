@@ -11,21 +11,29 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 import pytz
 from utils import StatsManager, WeatherCache
 import re
+from db import get_db_conn, db_lock, init_db
+from migrate import migrate
+import zipfile
+import shutil
+import sqlite3
 
 # Initialize environment
 load_dotenv()
 QWEATHER_KEY = os.getenv("QWEATHER_KEY", "")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
-USER_SETTINGS_FILE = "data/user_settings.json"
 
 # Ensure data directory exists
 os.makedirs("data", exist_ok=True)
+os.makedirs("backups", exist_ok=True)
+
+# Initialize database and migrate if needed
+init_db()
+migrate()
 
 app = App(token=SLACK_BOT_TOKEN)
 
 # Thread safety locks
-settings_lock = threading.Lock()
 schedule_lock = threading.Lock()
 
 # Global managers
@@ -34,48 +42,63 @@ weather_cache = WeatherCache()
 
 
 # User settings management
-def load_settings():
-    if os.path.exists(USER_SETTINGS_FILE):
-        try:
-            with open(USER_SETTINGS_FILE, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
-    return {}
-
-
-def save_settings(settings):
-    with open(USER_SETTINGS_FILE, "w") as f:
-        json.dump(settings, f, indent=4, ensure_ascii=False)
-
-
 def update_user_setting(
     user_id, city=None, time_str=None, timezone=None, subscribed=None, initialized=None
 ):
-    with settings_lock:
-        settings = load_settings()
-        if user_id not in settings:
-            settings[user_id] = {
-                "city": None,
-                "time": None,
-                "timezone": None,
-                "subscribed": False,
-                "initialized": False,
-            }
+    with db_lock:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
 
-        if city is not None:
-            settings[user_id]["city"] = city
-        if time_str is not None:
-            settings[user_id]["time"] = time_str
-        if timezone is not None:
-            settings[user_id]["timezone"] = timezone
-        if subscribed is not None:
-            settings[user_id]["subscribed"] = subscribed
-        if initialized is not None:
-            settings[user_id]["initialized"] = initialized
+            # Check if user exists
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
 
-        save_settings(settings)
-        user_setting = settings[user_id]
+            if not row:
+                cursor.execute(
+                    """
+                    INSERT INTO users (user_id, city, time, timezone, subscribed, initialized)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        user_id,
+                        city,
+                        time_str,
+                        timezone,
+                        1 if subscribed else 0,
+                        1 if initialized else 0,
+                    ),
+                )
+            else:
+                updates = []
+                params = []
+                if city is not None:
+                    updates.append("city = ?")
+                    params.append(city)
+                if time_str is not None:
+                    updates.append("time = ?")
+                    params.append(time_str)
+                if timezone is not None:
+                    updates.append("timezone = ?")
+                    params.append(timezone)
+                if subscribed is not None:
+                    updates.append("subscribed = ?")
+                    params.append(1 if subscribed else 0)
+                if initialized is not None:
+                    updates.append("initialized = ?")
+                    params.append(1 if initialized else 0)
+
+                if updates:
+                    params.append(user_id)
+                    cursor.execute(
+                        f'UPDATE users SET {", ".join(updates)} WHERE user_id = ?',
+                        params,
+                    )
+
+            conn.commit()
+
+            # Fetch updated setting
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            user_setting = dict(cursor.fetchone())
 
     # Update schedule
     if (
@@ -98,24 +121,30 @@ def update_user_setting(
 
 
 def get_user_setting(user_id):
-    with settings_lock:
-        settings = load_settings()
-        return settings.get(
-            user_id,
-            {
+    with db_lock:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+
+            if row:
+                return dict(row)
+            return {
                 "city": None,
                 "time": None,
                 "timezone": None,
                 "subscribed": False,
                 "initialized": False,
-            },
-        )
+            }
 
 
 def get_active_subscribers_count():
-    with settings_lock:
-        settings = load_settings()
-        return sum(1 for s in settings.values() if s.get("subscribed"))
+    with db_lock:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM users WHERE subscribed = 1")
+            count = cursor.fetchone()[0]
+            return count
 
 
 # Weather API Functions
@@ -565,17 +594,56 @@ def update_schedule(user_id, city, time_str, timezone_str):
         ).tag(user_id)
 
 
+def daily_backup():
+    try:
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        temp_db_path = f"backups/app_{date_str}.db"
+        backup_filename = f"backups/app_{date_str}.zip"
+        latest_filename = "backups/app_latest.zip"
+
+        # Ensure backup directory exists
+        os.makedirs("backups", exist_ok=True)
+
+        # Use SQLite's backup API to create a consistent copy of the database
+        with db_lock:
+            with get_db_conn() as source_conn:
+                dest_conn = sqlite3.connect(temp_db_path)
+                try:
+                    source_conn.backup(dest_conn)
+                finally:
+                    dest_conn.close()
+
+        # Zip the consistent copy
+        with zipfile.ZipFile(backup_filename, "w", zipfile.ZIP_DEFLATED) as zipf:
+            zipf.write(temp_db_path, arcname="app.db")
+
+        # Remove the temporary DB file
+        os.remove(temp_db_path)
+
+        # Create a copy for app_latest.zip
+        shutil.copy2(backup_filename, latest_filename)
+
+        print(f"✅ Backup created: {backup_filename} and {latest_filename}")
+    except Exception as e:
+        print(f"❌ Backup failed: {str(e)}")
+
+
 def init_schedule():
-    with settings_lock:
-        settings = load_settings()
-    for user_id, s in settings.items():
-        if (
-            s.get("subscribed")
-            and s.get("city")
-            and s.get("time")
-            and s.get("timezone")
-        ):
-            update_schedule(user_id, s.get("city"), s.get("time"), s.get("timezone"))
+    with db_lock:
+        with get_db_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM users WHERE subscribed = 1 AND city IS NOT NULL AND time IS NOT NULL AND timezone IS NOT NULL"
+            )
+            active_users = cursor.fetchall()
+
+    for s in active_users:
+        update_schedule(s["user_id"], s["city"], s["time"], s["timezone"])
+
+    # Schedule daily backup at 04:00
+    with schedule_lock:
+        schedule.every().day.at("04:00").do(daily_backup).tag("backup")
 
 
 def schedule_checker():
