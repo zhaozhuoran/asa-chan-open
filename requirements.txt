@@ -1,0 +1,5 @@
+slack_bolt
+requests
+python-dotenv
+schedule
+pytz
