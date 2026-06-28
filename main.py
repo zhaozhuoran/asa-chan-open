@@ -9,13 +9,14 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import pytz
-from utils import StatsManager, WeatherCache
+from utils import StatsManager, WeatherCache, translator, ai_client
 import re
 from db import get_db_conn, db_lock, init_db
 from migrate import migrate
 import zipfile
 import shutil
 import sqlite3
+from functools import lru_cache
 
 # Initialize environment
 load_dotenv()
@@ -41,9 +42,32 @@ stats_manager = StatsManager()
 weather_cache = WeatherCache()
 
 
+@lru_cache(maxsize=1024)
+def get_user_display_name(user_id):
+    try:
+        response = app.client.users_info(user=user_id)
+        if response["ok"]:
+            user = response["user"]
+            profile = user.get("profile", {})
+            # Prefer display_name, then real_name, then fallback
+            name = profile.get("display_name") or profile.get("real_name") or user.get("name")
+            return name if name else "user"
+        return "user"
+    except Exception as e:
+        print(f"Error fetching user info: {e}")
+        return "user"
+
+
 # User settings management
 def update_user_setting(
-    user_id, city=None, time_str=None, timezone=None, subscribed=None, initialized=None
+    user_id,
+    city=None,
+    time_str=None,
+    timezone=None,
+    subscribed=None,
+    initialized=None,
+    lang=None,
+    weather_mode=None,
 ):
     with db_lock:
         with get_db_conn() as conn:
@@ -56,8 +80,8 @@ def update_user_setting(
             if not row:
                 cursor.execute(
                     """
-                    INSERT INTO users (user_id, city, time, timezone, subscribed, initialized)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO users (user_id, city, time, timezone, subscribed, initialized, lang, weather_mode)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                     (
                         user_id,
@@ -66,6 +90,8 @@ def update_user_setting(
                         timezone,
                         1 if subscribed else 0,
                         1 if initialized else 0,
+                        lang or "en",
+                        weather_mode or "raw",
                     ),
                 )
             else:
@@ -86,6 +112,12 @@ def update_user_setting(
                 if initialized is not None:
                     updates.append("initialized = ?")
                     params.append(1 if initialized else 0)
+                if lang is not None:
+                    updates.append("lang = ?")
+                    params.append(lang)
+                if weather_mode is not None:
+                    updates.append("weather_mode = ?")
+                    params.append(weather_mode)
 
                 if updates:
                     params.append(user_id)
@@ -135,6 +167,8 @@ def get_user_setting(user_id):
                 "timezone": None,
                 "subscribed": False,
                 "initialized": False,
+                "lang": "en",
+                "weather_mode": "raw",
             }
 
 
@@ -265,10 +299,29 @@ def get_tz_from_str(timezone_str):
         return pytz.UTC
 
 
-def generate_report_daily(city_name: str, timezone_str="Asia/Shanghai"):
+def generate_report_daily(user_id: str, city_name: str, timezone_str="Asia/Shanghai"):
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    mode = setting.get("weather_mode", "raw")
+
     data = fetch_weather_daily(city_name)
     if not data or not data.get("daily") or len(data["daily"]) == 0:
-        return "⚠️ Failed to fetch weather data, please try again later"
+        return translator.t("fetch_failed", lang)
+
+    ai_warning = ""
+    if mode != "raw":
+        can_call, reason = stats_manager.can_make_ai_call(user_id)
+        if can_call:
+            display_name = get_user_display_name(user_id)
+            ai_report = ai_client.generate_weather_report(mode, data["daily"][0], display_name, lang)
+            if ai_report:
+                stats_manager.increment_ai_call(user_id)
+                return ai_report
+            # Fallback to raw if AI fails
+        elif reason == "user_limit":
+            ai_warning = f"\n\n> {translator.t('ai_limit_reached', lang)}"
+        elif reason == "global_limit":
+            ai_warning = f"\n\n> {translator.t('ai_global_limit_reached', lang)}"
 
     tz = get_tz_from_str(timezone_str)
     now = datetime.now(tz)
@@ -284,19 +337,21 @@ def generate_report_daily(city_name: str, timezone_str="Asia/Shanghai"):
 
     try:
         uv_warning = (
-            "\n⚠️ High UV Index, please use sun protection"
+            translator.t("uv_warning", lang)
             if int(uv_index) >= 5
             else ""
         )
     except:
         uv_warning = ""
 
-    return f"""🗓️ {now.strftime('%Y.%m.%d')} Weather Report for {city_name}:
-☀️ Condition: {text_day}
-🌡️ Temp: {temp_min}-{temp_max}℃
-☀️ UV Index: {uv_index}
-💨 Wind: Level {wind_scale_day} {wind_dir_day}
-💧 Humidity: {humidity}%{uv_warning}"""
+    header = translator.t("daily_report_header", lang, date=now.strftime('%Y.%m.%d'), city=city_name)
+    condition = translator.t("condition", lang, text=text_day)
+    temp = translator.t("temp_range", lang, min=temp_min, max=temp_max)
+    uv = translator.t("uv_index", lang, uv=uv_index)
+    wind = translator.t("wind_daily", lang, scale=wind_scale_day, dir=wind_dir_day)
+    hum = translator.t("humidity", lang, humidity=humidity)
+
+    return f"{header}\n{condition}\n{temp}\n{uv}\n{wind}\n{hum}{uv_warning}{ai_warning}"
 
 
 def fetch_weather_now(city_name: str):
@@ -330,10 +385,28 @@ def fetch_weather_now(city_name: str):
         return None
 
 
-def generate_report_now(city_name: str, timezone_str="Asia/Shanghai"):
+def generate_report_now(user_id: str, city_name: str, timezone_str="Asia/Shanghai"):
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    mode = setting.get("weather_mode", "raw")
+
     data = fetch_weather_now(city_name)
     if not data or not data.get("now"):
-        return "⚠️ Failed to fetch weather data, please try again later"
+        return translator.t("fetch_failed", lang)
+
+    ai_warning = ""
+    if mode != "raw":
+        can_call, reason = stats_manager.can_make_ai_call(user_id)
+        if can_call:
+            display_name = get_user_display_name(user_id)
+            ai_report = ai_client.generate_weather_report(mode, data["now"], display_name, lang)
+            if ai_report:
+                stats_manager.increment_ai_call(user_id)
+                return ai_report
+        elif reason == "user_limit":
+            ai_warning = f"\n\n> {translator.t('ai_limit_reached', lang)}"
+        elif reason == "global_limit":
+            ai_warning = f"\n\n> {translator.t('ai_global_limit_reached', lang)}"
 
     weather = data.get("now")
     tz = get_tz_from_str(timezone_str)
@@ -348,25 +421,20 @@ def generate_report_now(city_name: str, timezone_str="Asia/Shanghai"):
     pressure = weather.get("pressure", "N/A")
     precip = weather.get("precip", "N/A")
 
-    return f"""🗓️ {now.strftime('%Y.%m.%d %H:%M')} Real-time Weather for {city_name}:
-☀️ Condition: {text}
-🌡️ Temp: {temp}℃
-🌡️ Feels Like: {feels_like}℃
-💨 Wind: Level {wind_scale} {wind_dir}
-💧 Humidity: {humidity}%
-🌧️ Pressure: {pressure} hPa
-🌧️ Precipitation (last 1h): {precip} mm"""
+    header = translator.t("now_report_header", lang, date=now.strftime('%Y.%m.%d %H:%M'), city=city_name)
+    condition = translator.t("condition", lang, text=text)
+    temp_str = translator.t("temp_now", lang, temp=temp)
+    feels = translator.t("feels_like", lang, temp=feels_like)
+    wind = translator.t("wind_now", lang, scale=wind_scale, dir=wind_dir)
+    hum = translator.t("humidity", lang, humidity=humidity)
+    pres = translator.t("pressure", lang, pressure=pressure)
+    prec = translator.t("precipitation", lang, precip=precip)
+
+    return f"{header}\n{condition}\n{temp_str}\n{feels}\n{wind}\n{hum}\n{pres}\n{prec}{ai_warning}"
 
 
-def send_welcome_message(say, user_id):
-    welcome_text = (
-        f"Hello! 👋 Welcome to AsaChan Weather Bot.\n\n"
-        "To get started, you need to set up your preferences using the following commands:\n"
-        "1️⃣ `/asachan-setcity [City]` - Set your city (e.g., `/asachan-setcity Tokyo`)\n"
-        "2️⃣ `/asachan-settimezone [UTC Offset]` - Set your timezone (e.g., `/asachan-settimezone UTC+9` or `UTC-5:30`)\n"
-        "3️⃣ `/asachan-settime [HH:MM]` - Set your daily notification time (e.g., `/asachan-settime 08:00`)\n\n"
-        "Once these are set, you can use `/asachan-start` to subscribe to daily reports or `/asachan-now` for real-time weather.\n"
-    )
+def send_welcome_message(say, user_id, lang="en"):
+    welcome_text = translator.t("welcome", lang)
     say(welcome_text)
     update_user_setting(user_id, initialized=True)
 
@@ -376,7 +444,7 @@ def check_initialization(ack, say, command):
     user_id = command["user_id"]
     setting = get_user_setting(user_id)
     if not setting.get("initialized"):
-        send_welcome_message(say, user_id)
+        send_welcome_message(say, user_id, setting.get("lang", "en"))
         return False
     return True
 
@@ -391,7 +459,9 @@ def handle_message_events(event, say):
     if event.get("channel_type") == "im":
         setting = get_user_setting(user_id)
         if not setting.get("initialized"):
-            send_welcome_message(say, user_id)
+            lang = setting.get("lang", "en")
+            send_welcome_message(say, user_id, lang)
+            say(translator.t("first_time_notice", lang))
 
 
 # Slack Command Handlers
@@ -399,14 +469,20 @@ def handle_message_events(event, say):
 def handle_ping(ack, say, command):
     if not check_initialization(ack, say, command):
         return
-    say("Pong!")
+    user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    say(translator.t("ping", lang))
 
 
 @app.command("/asachan-up")
 def handle_up(ack, say, command):
     if not check_initialization(ack, say, command):
         return
-    say("Bot is up and running!")
+    user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    say(translator.t("up", lang))
 
 
 @app.command("/asachan-start")
@@ -415,31 +491,38 @@ def handle_start(ack, say, command):
         return
     user_id = command["user_id"]
     setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
 
     # Validation
     missing = []
     if not setting.get("city"):
-        missing.append("City (`/asachan-setcity`)")
+        missing.append(translator.t("missing_city", lang))
     if not setting.get("time"):
-        missing.append("Notification Time (`/asachan-settime`)")
+        missing.append(translator.t("missing_time", lang))
     if not setting.get("timezone"):
-        missing.append("Timezone (`/asachan-settimezone`)")
+        missing.append(translator.t("missing_timezone", lang))
 
     if missing:
         say(
-            f"❌ Subscription failed. Please complete your settings first:\n"
+            translator.t("sub_failed_settings", lang)
             + "\n".join(f"- {m}" for m in missing)
         )
         return
 
     # Check 1k subscriber limit
     if get_active_subscribers_count() >= 1000 and not setting.get("subscribed"):
-        say("❌ Sorry, the bot has reached the maximum number of subscribers (1000).")
+        say(translator.t("max_subscribers", lang))
         return
 
     setting = update_user_setting(user_id, subscribed=True)
     say(
-        f"✅ Subscription successful! Daily weather report will be sent at {setting['time']} ({setting['timezone']})\n📍 Current City: {setting['city']}"
+        translator.t(
+            "sub_success",
+            lang,
+            time=setting["time"],
+            timezone=setting["timezone"],
+            city=setting["city"],
+        )
     )
 
 
@@ -448,8 +531,9 @@ def handle_unsub(ack, say, command):
     if not check_initialization(ack, say, command):
         return
     user_id = command["user_id"]
+    setting = get_user_setting(user_id)
     update_user_setting(user_id, subscribed=False)
-    say("❎ Unsubscribed successfully")
+    say(translator.t("unsub_success", setting.get("lang", "en")))
 
 
 @app.command("/asachan-now")
@@ -458,23 +542,21 @@ def handle_now(ack, say, command):
         return
     user_id = command["user_id"]
     setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
 
     if not setting.get("city"):
-        say("❌ City not set. Please use `/asachan-setcity [City]` first.")
+        say(translator.t("city_not_set", lang))
         return
 
-    # Quota check for now requests: subscribers are always allowed (if API quota permits)
-    # Non-subscribers are limited to (1000 - current_subscribers) total requests per day
+    # Quota check for now requests
     if not setting.get("subscribed"):
         if not stats_manager.can_make_now_request(get_active_subscribers_count()):
-            say(
-                "❌ The bot is currently receiving too many requests. Please try again later."
-            )
+            say(translator.t("too_many_requests", lang))
             return
         stats_manager.increment_now_request()
 
     report = generate_report_now(
-        setting["city"], setting.get("timezone", "Asia/Shanghai")
+        user_id, setting["city"], setting.get("timezone", "Asia/Shanghai")
     )
     say(report)
 
@@ -485,13 +567,17 @@ def handle_status(ack, say, command):
         return
     user_id = command["user_id"]
     setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
 
-    status_msg = f"📍 City: {setting.get('city') or 'Not set'}\n"
-    status_msg += f"⏰ Time: {setting.get('time') or 'Not set'}\n"
-    status_msg += f"🌍 Timezone: {setting.get('timezone') or 'Not set'}\n"
-    status_msg += f"🔔 Subscribed: {'Yes' if setting.get('subscribed') else 'No'}"
+    not_set_str = translator.t("not_set", lang)
+    status_msg = translator.t("status_city", lang, city=setting.get('city') or not_set_str) + "\n"
+    status_msg += translator.t("status_time", lang, time=setting.get('time') or not_set_str) + "\n"
+    status_msg += translator.t("status_timezone", lang, timezone=setting.get('timezone') or not_set_str) + "\n"
+    status_msg += translator.t("status_subscribed", lang, subscribed=translator.t("yes" if setting.get("subscribed") else "no", lang)) + "\n"
+    status_msg += translator.t("status_lang", lang, lang=setting.get("lang", "en")) + "\n"
+    status_msg += translator.t("status_mode", lang, mode=setting.get("weather_mode", "raw"))
 
-    say(f"Current Settings:\n{status_msg}")
+    say(f"{translator.t('current_settings_header', lang)}\n{status_msg}")
 
 
 @app.command("/asachan-setcity")
@@ -499,20 +585,22 @@ def handle_setcity(ack, say, command):
     if not check_initialization(ack, say, command):
         return
     user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
     text = command.get("text", "").strip()
     if not text:
-        say("Please provide a city name, e.g., `/asachan-setcity Shanghai`")
+        say(translator.t("provide_city", lang))
         return
 
     city_name = text
     try:
         get_location_id(city_name)
         update_user_setting(user_id, city=city_name)
-        say(f"✅ City set to: {city_name}")
+        say(translator.t("city_set", lang, city=city_name))
     except ValueError:
-        say(f"❌ City not found: {city_name}, please check the spelling")
+        say(translator.t("city_not_found", lang, city=city_name))
     except Exception as e:
-        say(f"❌ Failed to set city: {str(e)}")
+        say(translator.t("city_set_failed", lang, error=str(e)))
 
 
 @app.command("/asachan-settime")
@@ -520,17 +608,19 @@ def handle_settime(ack, say, command):
     if not check_initialization(ack, say, command):
         return
     user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
     text = command.get("text", "").strip()
     if not text:
-        say("Please provide a time (HH:MM), e.g., `/asachan-settime 08:30`")
+        say(translator.t("provide_time", lang))
         return
 
     try:
         datetime.strptime(text, "%H:%M")
         update_user_setting(user_id, time_str=text)
-        say(f"✅ Notification time set to: {text}")
+        say(translator.t("time_set", lang, time=text))
     except ValueError:
-        say("❌ Invalid time format, please use HH:MM (e.g., 07:15)")
+        say(translator.t("time_invalid", lang))
 
 
 @app.command("/asachan-settimezone")
@@ -538,24 +628,73 @@ def handle_settimezone(ack, say, command):
     if not check_initialization(ack, say, command):
         return
     user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
     text = command.get("text", "").strip().upper()
     if not text:
-        say(
-            "Please provide a UTC offset, e.g., `/asachan-settimezone UTC+8` or `UTC-5:30`"
-        )
+        say(translator.t("provide_timezone", lang))
         return
 
     # Validate format: UTC[+/-]H[:MM]
     pattern = r"^UTC[+-](\d{1,2})(:(\d{2}))?$"
     match = re.match(pattern, text)
     if not match:
-        say(
-            "❌ Invalid timezone format. Please use UTC+H, UTC+H:MM, UTC-H, or UTC-H:MM (e.g., UTC+8, UTC-5:30)"
-        )
+        say(translator.t("timezone_invalid", lang))
         return
 
     update_user_setting(user_id, timezone=text)
-    say(f"✅ Timezone set to: {text}")
+    say(translator.t("timezone_set", lang, timezone=text))
+
+
+@app.command("/asachan-mode")
+def handle_mode(ack, say, command):
+    if not check_initialization(ack, say, command):
+        return
+    user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    text = command.get("text", "").strip().lower()
+
+    if not text:
+        say(translator.t("provide_mode", lang))
+        return
+
+    if text not in ["raw", "cute", "normal"]:
+        say(translator.t("mode_invalid", lang))
+        return
+
+    update_user_setting(user_id, weather_mode=text)
+    say(translator.t("mode_set", lang, mode=text))
+
+
+@app.command("/asachan-lang")
+def handle_lang(ack, say, command):
+    if not check_initialization(ack, say, command):
+        return
+    user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    text = command.get("text", "").strip().lower()
+
+    if not text:
+        say(translator.t("provide_lang", lang))
+        return
+
+    if text not in ["en", "zh"]:
+        say(translator.t("lang_invalid", lang))
+        return
+
+    update_user_setting(user_id, lang=text)
+    say(translator.t("lang_set", text, lang=text))
+
+
+@app.command("/asachan-privacy")
+def handle_privacy(ack, say, command):
+    ack()
+    user_id = command["user_id"]
+    setting = get_user_setting(user_id)
+    lang = setting.get("lang", "en")
+    say(translator.t("privacy_policy", lang))
 
 
 @app.command("/asachan-dailynow")
@@ -566,18 +705,18 @@ def handle_dailynow(ack, say, command):
     setting = get_user_setting(user_id)
 
     if not setting.get("city"):
-        say("❌ City not set. Please use `/asachan-setcity [City]` first.")
+        say(translator.t("city_not_set", setting.get("lang", "en")))
         return
 
     report = generate_report_daily(
-        setting["city"], setting.get("timezone", "Asia/Shanghai")
+        user_id, setting["city"], setting.get("timezone", "Asia/Shanghai")
     )
     say(report)
 
 
 # Task Scheduling System
 def send_daily_report(user_id, city, timezone_str):
-    report = generate_report_daily(city, timezone_str)
+    report = generate_report_daily(user_id, city, timezone_str)
     try:
         app.client.chat_postMessage(channel=user_id, text=report)
     except Exception as e:
@@ -623,6 +762,14 @@ def daily_backup():
 
         # Create a copy for app_latest.zip
         shutil.copy2(backup_filename, latest_filename)
+
+        # Cleanup stale AI stats (older than 7 days)
+        seven_days_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        with db_lock:
+            with get_db_conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM user_ai_stats WHERE day < ?", (seven_days_ago,))
+                conn.commit()
 
         print(f"✅ Backup created: {backup_filename} and {latest_filename}")
     except Exception as e:
