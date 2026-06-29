@@ -12,6 +12,12 @@ A Slack bot that pushes weather forecasts from QWeather.
 - Real-time weather query
 - Customizable city and notification time per user
 
+## 🌟 Project Origin
+
+This project was developed as part of Hack Club Stardance.
+
+View the original project page: [https://stardance.hackclub.com/projects/25782](https://stardance.hackclub.com/projects/25782)
+
 ## Installation and Setup
 
 ### 1. Prerequisites
